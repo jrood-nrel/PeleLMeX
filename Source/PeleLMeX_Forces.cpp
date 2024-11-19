@@ -1,5 +1,6 @@
 #include <PeleLMeX.H>
 #include <PeleLMeX_K.H>
+#include <PeleLMeX_ProblemSpecificFunctions.H>
 
 using namespace amrex;
 
@@ -170,4 +171,112 @@ PeleLM::getVelForces(
         i, j, k, is_incomp, rho_incomp, pseudo_gravity, ps_dir, a_time, grav,
         gp0, dV_control, dx, vel, rho, rhoY, rhoh, temp, extMom, extRho, force);
     });
+}
+
+void
+PeleLM::addSpark(const TimeStamp& a_timestamp)
+{
+  for (int lev = 0; lev <= finest_level; lev++) {
+    for (int n = 0; n < m_n_sparks; n++) {
+      // Do the checks first
+      Real time = getTime(lev, a_timestamp);
+      bool verb = m_spark_verbose > 1 && lev == 0;
+      if (
+        time < m_spark_time[n] ||
+        time > m_spark_time[n] + m_spark_duration[n]) {
+        if (verb) {
+          Print() << m_spark[n] << " not active" << std::endl;
+        }
+        continue;
+      }
+      const Real* probLo = geom[lev].ProbLo();
+      auto const dx = geom[lev].CellSizeArray();
+      IntVect spark_idx;
+      for (int d = 0; d < AMREX_SPACEDIM; d++) {
+        spark_idx[d] = (int)((m_spark_location[n][d] - probLo[d]) / dx[d]);
+      }
+      Box domainBox = geom[lev].Domain();
+      // just a check
+      if (!domainBox.contains(spark_idx)) {
+        Warning(m_spark[n] + " not in domain!");
+        continue;
+      }
+      if (verb) {
+        Print() << m_spark[n] << " active" << std::endl;
+      }
+
+      auto statema = getLevelDataPtr(lev, a_timestamp)->state.const_arrays();
+      auto extma = m_extSource[lev]->arrays();
+      auto const* leosparm = eos_parms.device_parm();
+
+      amrex::ParallelFor(
+        *m_extSource[lev],
+        [=, spark_duration = m_spark_duration[n], spark_temp = m_spark_temp[n],
+         eosparm = leosparm,
+         spark_radius = m_spark_radius
+           [n]] AMREX_GPU_DEVICE(int box_no, int i, int j, int k) noexcept {
+          auto eos = pele::physics::PhysicsType::eos(eosparm);
+          Real dist_to_center = std::sqrt(AMREX_D_TERM(
+            (i - spark_idx[0]) * (i - spark_idx[0]) * dx[0] * dx[0],
+            +(j - spark_idx[1]) * (j - spark_idx[1]) * dx[1] * dx[1],
+            +(k - spark_idx[2]) * (k - spark_idx[2]) * dx[2] * dx[2]));
+          if (dist_to_center < spark_radius) {
+            Real rhoh_src_loc = 0;
+            Real rho = statema[box_no](i, j, k, DENSITY);
+            Real Y[NUM_SPECIES];
+            for (int ns = 0; ns < NUM_SPECIES; ns++) {
+              Y[ns] = statema[box_no](i, j, k, FIRSTSPEC + ns) / rho;
+            }
+            eos.TY2H(spark_temp, Y, rhoh_src_loc);
+            rhoh_src_loc *= rho * 1e-4 / spark_duration;
+            extma[box_no](i, j, k, RHOH) = rhoh_src_loc;
+          }
+        });
+      Gpu::streamSynchronize();
+    }
+  }
+}
+
+// Calculate additional external sources (soot, radiation, user defined, etc.)
+void
+PeleLM::getExternalSources(
+  int is_initIter,
+  const PeleLM::TimeStamp& a_timestamp_old,
+  const PeleLM::TimeStamp& a_timestamp_new)
+{
+  amrex::ignore_unused(is_initIter);
+
+  if (m_n_sparks > 0) {
+    addSpark(a_timestamp_old);
+  }
+
+#ifdef PELE_USE_SPRAY
+  if (is_initIter == 0) {
+    SprayMKD(m_cur_time, m_dt);
+  }
+#endif
+#ifdef PELE_USE_SOOT
+  if (do_soot_solve) {
+    computeSootSource(a_timestamp_old, m_dt);
+  }
+#endif
+#ifdef PELE_USE_RADIATION
+  if (do_rad_solve) {
+    BL_PROFILE_VAR("PeleLM::advance::rad", PLM_RAD);
+    computeRadSource(a_timestamp_old);
+    BL_PROFILE_VAR_STOP(PLM_RAD);
+  }
+#endif
+
+  // User defined external sources
+  if (m_user_defined_ext_sources) {
+    for (int lev = 0; lev <= finest_level; lev++) {
+      auto* ldata_p_old = getLevelDataPtr(lev, a_timestamp_old);
+      auto* ldata_p_new = getLevelDataPtr(lev, a_timestamp_new);
+      auto& ext_src = m_extSource[lev];
+      problem_modify_ext_sources(
+        getTime(lev, a_timestamp_new), m_dt, ldata_p_old->state,
+        ldata_p_new->state, ext_src, geom[lev].data(), *prob_parm_d);
+    }
+  }
 }
